@@ -253,7 +253,7 @@ export class DevGuardService {
   ): Promise<TestsResult> {
     const codexBin = this.runner.resolveCodexExecutable();
     if (!codexBin) {
-      throw new Error("Codex binary not found. Run `devguard-mcp doctor` for setup details.");
+      throw new Error("Codex binary not found. Run `devgaurd doctor` for setup details.");
     }
 
     const login = await this.runner.checkCodexLoginAsync(codexBin);

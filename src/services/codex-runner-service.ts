@@ -755,7 +755,7 @@ Return JSON only with:
   }
 
   createEphemeralWorkspace(projectPath: string): string {
-    const workspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), "devguard-code-tester-"));
+    const workspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), "devgaurd-code-tester-"));
     const destination = path.join(workspaceRoot, path.basename(projectPath));
     fs.cpSync(projectPath, destination, {
       recursive: true,

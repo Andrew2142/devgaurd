@@ -83,11 +83,11 @@ export class DashboardServer {
 
   private configureRoutes(): void {
     this.app.get("/", (_req, res) => res.redirect("/runs"));
-    this.app.get("/health", (_req, res) => res.json({ ok: true, service: "devguard-dashboard" }));
+    this.app.get("/health", (_req, res) => res.json({ ok: true, service: "devgaurd-dashboard" }));
     this.app.get("/runs", (_req, res) => {
       const runs = this.store.listRuns(50);
-      res.type("html").send(this.renderLayout("DevGuard Runs", `
-        <h1>DevGuard Runs</h1>
+      res.type("html").send(this.renderLayout("devgaurd Runs", `
+        <h1>devgaurd Runs</h1>
         <p class="muted">Recent MCP-triggered reviews and scans.</p>
         <div class="list">
           ${runs.map((run) => this.renderRunCard(run)).join("") || "<p>No runs yet.</p>"}

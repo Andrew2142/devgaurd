@@ -85,7 +85,7 @@ export class McpServer {
             tools: {},
           },
           serverInfo: {
-            name: "devguard-mcp",
+            name: "devgaurd-mcp",
             version: "1.0.0",
           },
         },

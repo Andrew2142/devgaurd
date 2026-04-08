@@ -19,10 +19,10 @@ export function getDevGuardConfig(): DevGuardConfig {
   return {
     baseDir,
     artifactsDir: path.join(baseDir, "artifacts"),
-    dbPath: path.join(baseDir, "devguard.db"),
+    dbPath: path.join(baseDir, "devgaurd.db"),
     dashboardHost: process.env.DEVGUARD_DASHBOARD_HOST || "127.0.0.1",
     dashboardPort: parseInt(process.env.DEVGUARD_DASHBOARD_PORT || "4680", 10),
-    serverName: "devguard-mcp",
+    serverName: "devgaurd-mcp",
     serverVersion: "1.0.0",
     defaultModel: process.env.DEVGUARD_DEFAULT_MODEL || "gpt-5.2-codex",
   };
@@ -39,12 +39,12 @@ function resolveBaseDir(): string {
     return path.resolve(explicit);
   }
 
-  const preferred = path.join(os.homedir(), ".devguard");
+  const preferred = path.join(os.homedir(), ".devgaurd");
   if (canCreateDir(preferred)) {
     return preferred;
   }
 
-  return path.join(process.cwd(), ".devguard");
+  return path.join(process.cwd(), ".devgaurd");
 }
 
 function canCreateDir(dirPath: string): boolean {
