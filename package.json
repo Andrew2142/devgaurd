@@ -1,0 +1,38 @@
+{
+  "name": "devgaurd",
+  "version": "1.0.0",
+  "description": "Local-first MCP server for commit testing, code scanning, and dependency vulnerability review",
+  "main": "dist/devguard/cli.js",
+  "bin": {
+    "devgaurd": "dist/devguard/cli.js",
+    "devgaurd-mcp": "dist/devguard/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/devguard/cli.js",
+    "doctor": "node dist/devguard/cli.js doctor",
+    "test": "npm run build && node --test test/devguard/*.test.js"
+  },
+  "keywords": [
+    "mcp",
+    "codex",
+    "claude-code",
+    "testing",
+    "security"
+  ],
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "eslint": "^9.17.0",
+    "express": "^5.1.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.3",
+    "@types/node": "^24.5.2",
+    "typescript": "^5.9.2"
+  },
+  "engines": {
+    "node": ">=24.0.0",
+    "npm": ">=8.0.0"
+  }
+}
