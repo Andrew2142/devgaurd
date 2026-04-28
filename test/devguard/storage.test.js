@@ -7,14 +7,14 @@ const { createConfig } = require("./helpers.js");
 test("DevGuardStore creates and updates runs", () => {
   const store = new DevGuardStore(createConfig());
   const run = store.createRun({
-    kind: "scan_code",
+    kind: "lint_code",
     status: "queued",
     repoPath: "/tmp/project",
     gitTarget: "latest-commit",
     gitRefOrRange: null,
     model: "gpt-5.2-codex",
     dashboardUrl: "http://127.0.0.1:4680/runs/1",
-    summary: "Queued scan",
+    summary: "Queued lint",
   });
 
   store.appendProgress(run.id, "queued", "Queued", "active");

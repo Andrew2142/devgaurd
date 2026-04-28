@@ -1,7 +1,7 @@
 {
   "name": "devgaurd",
   "version": "1.0.0",
-  "description": "Local-first MCP server for commit testing, code scanning, and dependency vulnerability review",
+  "description": "Local-first MCP guard for test generation, lint feedback, and dependency risk reports",
   "main": "dist/devguard/cli.js",
   "bin": {
     "devgaurd": "dist/devguard/cli.js",

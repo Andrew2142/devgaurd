@@ -16,19 +16,20 @@ function createDashboardStub({ available = true, error = null } = {}) {
   };
 }
 
-test("startCodeScan completes in the background and persists findings", async () => {
+test("startLintCode completes in the background and persists findings", async () => {
   const config = createConfig("devguard-service-test-");
   const store = new DevGuardStore(config);
   const service = new DevGuardService(config, store, createDashboardStub());
   const repoDir = createNodeRepo({
-    "src/index.ts": "console.log('debug');\n",
+    "src/index.ts": "const value: any = 1;\n",
   });
 
-  const summary = await service.startCodeScan({ repo_path: repoDir });
+  const summary = await service.startLintCode({ repo_path: repoDir });
   const completed = await service.waitForRun(summary.run_id);
 
   assert.equal(completed.status, "completed");
-  assert.ok(completed.codeFindings.length >= 1);
+  assert.equal(completed.kind, "lint_code");
+  assert.ok(completed.lintFindings.length >= 1);
   assert.equal(completed.error, null);
 });
 
@@ -41,10 +42,10 @@ test("dashboard startup failure degrades gracefully", async () => {
     createDashboardStub({ available: false, error: "port busy" }),
   );
   const repoDir = createNodeRepo({
-    "src/index.ts": "console.log('debug');\n",
+    "src/index.ts": "const value: any = 1;\n",
   });
 
-  const summary = await service.startCodeScan({ repo_path: repoDir });
+  const summary = await service.startLintCode({ repo_path: repoDir });
   const run = store.getRun(summary.run_id);
 
   assert.ok(run);
@@ -53,7 +54,7 @@ test("dashboard startup failure degrades gracefully", async () => {
   assert.equal(run.metadata.dashboardError, "port busy");
 });
 
-test("applyGeneratedTests only writes accepted test files", async () => {
+test("commitGeneratedTests only writes accepted test files", async () => {
   const config = createConfig("devguard-apply-test-");
   const store = new DevGuardStore(config);
   const service = new DevGuardService(config, store, createDashboardStub());
@@ -80,8 +81,8 @@ test("applyGeneratedTests only writes accepted test files", async () => {
     },
   });
 
-  const result = await service.applyGeneratedTests(safeRun.id);
-  assert.equal(result.applied_files.length, 1);
+  const result = await service.commitGeneratedTests(safeRun.id);
+  assert.equal(result.committed_files.length, 1);
   assert.equal(fs.existsSync(path.join(repoDir, "src/index.test.ts")), true);
 
   const unsafeRun = store.createRun({
@@ -105,5 +106,5 @@ test("applyGeneratedTests only writes accepted test files", async () => {
     },
   });
 
-  await assert.rejects(() => service.applyGeneratedTests(unsafeRun.id), /Refusing to apply rejected file targets/);
+  await assert.rejects(() => service.commitGeneratedTests(unsafeRun.id), /Refusing to apply rejected file targets/);
 });

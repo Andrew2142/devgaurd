@@ -1,7 +1,8 @@
 import { ESLint } from 'eslint';
-import * as path from 'path';
-import * as fs from 'fs';
+import * as path from 'node:path';
+import * as fs from 'node:fs';
 
+/** Normalized static-analysis finding shared by all built-in analyzers. */
 export interface CodeIssueResult {
   tier: number;
   category: string;
@@ -15,11 +16,11 @@ export interface CodeIssueResult {
   snippet: string | null;
 }
 
+/** Runs ESLint with a conservative default rule set for Node and TypeScript projects. */
 export class EslintAnalyzer {
 
   /**
-   * Run ESLint against a Node.js project
-   * Uses the project's own .eslintrc if present, otherwise uses a sensible default config
+   * Runs ESLint against the source tree and converts messages into DevGuard findings.
    */
   async analyze(projectPath: string): Promise<CodeIssueResult[]> {
     const issues: CodeIssueResult[] = [];
@@ -91,7 +92,6 @@ export class EslintAnalyzer {
         }
       }
     } catch (error) {
-      console.error('ESLint analyzer error:', error);
       issues.push({
         tier: 1,
         category: 'lint',
@@ -110,7 +110,7 @@ export class EslintAnalyzer {
   }
 
   /**
-   * Extract a 3-line snippet around the issue line
+   * Extracts a three-line snippet around the reported issue line.
    */
   private extractSnippet(source: string, line: number | undefined): string | null {
     if (!line || !source) return null;

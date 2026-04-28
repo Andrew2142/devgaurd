@@ -1,7 +1,8 @@
-import * as fs from 'fs';
-import * as path from 'path';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 import { CodeIssueResult } from './eslint-analyzer';
 
+/** Regex-backed consistency rule applied to selected source file extensions. */
 interface ConsistencyRule {
   rule: string;
   severity: 'error' | 'warning' | 'info';
@@ -10,23 +11,12 @@ interface ConsistencyRule {
   fileExtensions: string[];
 }
 
+const MAX_SOURCE_LINES = 900;
+
+/** Scans source files for style and maintainability patterns that are not covered by ESLint. */
 export class ConsistencyAnalyzer {
 
   private rules: ConsistencyRule[] = [
-    {
-      rule: 'console-log',
-      severity: 'warning',
-      message: 'console.log statement found — remove before production',
-      pattern: /console\.log\s*\(/,
-      fileExtensions: ['.ts', '.js', '.tsx', '.jsx'],
-    },
-    {
-      rule: 'console-debug',
-      severity: 'info',
-      message: 'console.debug statement found',
-      pattern: /console\.debug\s*\(/,
-      fileExtensions: ['.ts', '.js', '.tsx', '.jsx'],
-    },
     {
       rule: 'todo-comment',
       severity: 'info',
@@ -40,13 +30,6 @@ export class ConsistencyAnalyzer {
       message: 'Empty catch block — errors should be handled or logged',
       pattern: /catch\s*\([^)]*\)\s*\{\s*\}/,
       fileExtensions: ['.ts', '.js', '.tsx', '.jsx'],
-    },
-    {
-      rule: 'hardcoded-url',
-      severity: 'warning',
-      message: 'Hardcoded URL found — consider using environment variables',
-      pattern: /['\"`](https?:\/\/(?!localhost)[^\s'\"`]+)['\"`]/,
-      fileExtensions: ['.ts', '.js', '.tsx', '.jsx', '.php'],
     },
     {
       rule: 'hardcoded-ip',
@@ -72,7 +55,7 @@ export class ConsistencyAnalyzer {
   ];
 
   /**
-   * Scan project source files for consistency issues
+   * Scans project source files and returns consistency findings with portable relative paths.
    */
   async analyze(projectPath: string): Promise<CodeIssueResult[]> {
     const issues: CodeIssueResult[] = [];
@@ -97,7 +80,7 @@ export class ConsistencyAnalyzer {
         const lines = content.split('\n');
 
         // Check file-level issue: excessive line count
-        if (lines.length > 500) {
+        if (lines.length > MAX_SOURCE_LINES) {
           issues.push({
             tier: 2,
             category: 'consistency',
@@ -114,11 +97,12 @@ export class ConsistencyAnalyzer {
 
         // Test every line against each rule, skipping rules not matching the file extension
         for (let i = 0; i < lines.length; i++) {
-          const line = lines[i];
+          const line = lines[i] || '';
           const lineNumber = i + 1;
 
           for (const rule of this.rules) {
             if (!rule.fileExtensions.includes(ext)) continue;
+            if (rule.rule === 'hardcoded-ip' && /['"`](127\.0\.0\.1|0\.0\.0\.0)['"`]/.test(line)) continue;
             if (rule.pattern.test(line)) {
               issues.push({
                 tier: 2,
@@ -137,7 +121,6 @@ export class ConsistencyAnalyzer {
         }
       }
     } catch (error) {
-      console.error('Consistency analyzer error:', error);
       issues.push({
         tier: 2,
         category: 'consistency',
@@ -156,13 +139,14 @@ export class ConsistencyAnalyzer {
   }
 
   /**
-   * Recursively collect source files, skipping ignored directories
+   * Recursively collects source files while skipping dependency and build directories.
    */
   private collectSourceFiles(dirPath: string): string[] {
     const files: string[] = [];
-    const ignored = new Set(['node_modules', 'dist', 'build', '.next', '.git', 'vendor', 'coverage', '.angular']);
+    const ignored = new Set(['node_modules', 'dist', 'build', '.next', '.git', 'vendor', 'coverage', '.angular', '.devgaurd', '.codex']);
 
-    const walk = (dir: string) => {
+    /** Visits one directory and appends eligible files to the shared result list. */
+    const walk = (dir: string): void => {
       let entries: fs.Dirent[];
       try {
         entries = fs.readdirSync(dir, { withFileTypes: true });
@@ -192,6 +176,7 @@ export class ConsistencyAnalyzer {
     return files;
   }
 
+  /** Returns a small source excerpt around a finding line for review context. */
   private getSnippet(lines: string[], lineNumber: number): string | null {
     const start = Math.max(0, lineNumber - 2);
     const end = Math.min(lines.length, lineNumber + 1);

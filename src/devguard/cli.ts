@@ -8,6 +8,7 @@ import { DevGuardService } from "./service";
 import { DevGuardStore } from "./storage";
 import { toErrorMessage } from "./errors";
 
+/** Starts either the doctor command or the stdio MCP server. */
 async function main(): Promise<void> {
   const config = getDevGuardConfig();
   const store = new DevGuardStore(config);
@@ -26,6 +27,7 @@ async function main(): Promise<void> {
   }
 
   const server = new McpServer(service);
+  /** Closes local resources before exiting after a termination signal. */
   const shutdown = async () => {
     try {
       await dashboard.close();

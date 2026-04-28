@@ -1,9 +1,9 @@
-import fs from "fs";
-import path from "path";
+import fs from "node:fs";
+import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { DevGuardConfig, ensureDevGuardDirs } from "./config";
 import {
-  CodeFinding,
+  LintFinding,
   DependencyFinding,
   GeneratedArtifact,
   GitTargetMode,
@@ -14,6 +14,7 @@ import {
   TestsResult,
 } from "./types";
 
+/** Required fields for inserting a new run row. */
 type RunInsert = {
   kind: RunKind;
   status: RunStatus;
@@ -26,6 +27,7 @@ type RunInsert = {
   metadata?: Record<string, unknown>;
 };
 
+/** Fields that can be updated on an existing run row. */
 type RunPatch = Partial<{
   status: RunStatus;
   dashboardUrl: string;
@@ -35,16 +37,18 @@ type RunPatch = Partial<{
   progressLog: ProgressEntry[];
   gitContext: Record<string, unknown> | null;
   testsResult: TestsResult | null;
-  codeFindings: CodeFinding[];
+  lintFindings: LintFinding[];
   dependencyFindings: DependencyFinding[];
   generatedArtifacts: GeneratedArtifact[];
   metadata: Record<string, unknown>;
 }>;
 
+/** Provides the SQLite persistence layer for runs, artifacts metadata, and OSV cache entries. */
 export class DevGuardStore {
   private db: DatabaseSync;
 
-  constructor(private config: DevGuardConfig) {
+  /** Opens the local SQLite database and creates required tables/indexes. */
+  constructor(config: DevGuardConfig) {
     ensureDevGuardDirs(config);
     fs.mkdirSync(path.dirname(config.dbPath), { recursive: true });
     this.db = new DatabaseSync(config.dbPath);
@@ -82,6 +86,7 @@ export class DevGuardStore {
     `);
   }
 
+  /** Inserts a new run row and returns the hydrated stored run. */
   createRun(input: RunInsert): StoredRun {
     const now = new Date().toISOString();
     const statement = this.db.prepare(`
@@ -116,16 +121,19 @@ export class DevGuardStore {
     return this.getRun(Number(result.lastInsertRowid))!;
   }
 
+  /** Fetches one run by id, returning null when it does not exist. */
   getRun(runId: number): StoredRun | null {
     const row = this.db.prepare("SELECT * FROM runs WHERE id = ?").get(runId) as Record<string, unknown> | undefined;
     return row ? this.mapRun(row) : null;
   }
 
+  /** Lists recent runs in reverse creation order. */
   listRuns(limit = 20): StoredRun[] {
     const rows = this.db.prepare("SELECT * FROM runs ORDER BY created_at DESC LIMIT ?").all(limit) as Record<string, unknown>[];
     return rows.map((row) => this.mapRun(row));
   }
 
+  /** Applies a partial update to a run and returns the refreshed record. */
   updateRun(runId: number, patch: RunPatch): StoredRun {
     const current = this.getRun(runId);
     if (!current) {
@@ -143,7 +151,7 @@ export class DevGuardStore {
       progressLog: patch.progressLog ?? current.progressLog,
       gitContext: patch.gitContext !== undefined ? patch.gitContext : current.gitContext,
       testsResult: patch.testsResult !== undefined ? patch.testsResult : current.testsResult,
-      codeFindings: patch.codeFindings ?? current.codeFindings,
+      lintFindings: patch.lintFindings ?? current.lintFindings,
       dependencyFindings: patch.dependencyFindings ?? current.dependencyFindings,
       generatedArtifacts: patch.generatedArtifacts ?? current.generatedArtifacts,
       metadata: patch.metadata ?? current.metadata,
@@ -165,7 +173,7 @@ export class DevGuardStore {
       this.toJson(next.progressLog),
       this.toJson(next.gitContext),
       this.toJson(next.testsResult),
-      this.toJson(next.codeFindings),
+      this.toJson(next.lintFindings),
       this.toJson(next.dependencyFindings),
       this.toJson(next.generatedArtifacts),
       this.toJson(next.metadata),
@@ -175,6 +183,7 @@ export class DevGuardStore {
     return this.getRun(runId)!;
   }
 
+  /** Appends a progress entry and marks older active entries as done. */
   appendProgress(runId: number, step: string, message: string, status: "active" | "done" = "done"): StoredRun {
     const run = this.getRun(runId);
     if (!run) {
@@ -195,6 +204,7 @@ export class DevGuardStore {
     return this.updateRun(runId, { progressLog: nextLog });
   }
 
+  /** Reads a cached OSV advisory response by cache key. */
   getCachedAdvisory(cacheKey: string): unknown | null {
     const row = this.db.prepare("SELECT response_json FROM advisory_cache WHERE cache_key = ?").get(cacheKey) as { response_json?: string } | undefined;
     if (!row?.response_json) {
@@ -204,6 +214,7 @@ export class DevGuardStore {
     return this.fromJson(row.response_json, null);
   }
 
+  /** Stores or refreshes a cached OSV advisory response. */
   putCachedAdvisory(cacheKey: string, payload: unknown): void {
     this.db.prepare(`
       INSERT INTO advisory_cache(cache_key, response_json, updated_at)
@@ -214,6 +225,7 @@ export class DevGuardStore {
     `).run(cacheKey, this.toJson(payload), new Date().toISOString());
   }
 
+  /** Maps a raw SQLite row into the public StoredRun shape. */
   private mapRun(row: Record<string, unknown>): StoredRun {
     return {
       id: Number(row.id),
@@ -233,17 +245,19 @@ export class DevGuardStore {
       progressLog: this.fromJson(row.progress_log, []),
       gitContext: this.fromJson(row.git_context, null),
       testsResult: this.fromJson(row.tests_result, null),
-      codeFindings: this.fromJson(row.code_findings, []),
+      lintFindings: this.fromJson(row.code_findings, []),
       dependencyFindings: this.fromJson(row.dependency_findings, []),
       generatedArtifacts: this.fromJson(row.generated_artifacts, []),
       metadata: this.fromJson(row.metadata, {}),
     };
   }
 
+  /** Serializes nullable JSON fields for SQLite storage. */
   private toJson(value: unknown): string {
     return JSON.stringify(value ?? null);
   }
 
+  /** Parses a JSON SQLite field and falls back when the stored value is invalid. */
   private fromJson<T>(value: unknown, fallback: T): T {
     if (typeof value !== "string" || value.trim() === "") {
       return fallback;

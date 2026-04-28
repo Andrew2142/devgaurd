@@ -1,19 +1,16 @@
-import * as fs from 'fs';
-import * as path from 'path';
+import fs from "node:fs";
+import path from "node:path";
 
-/**
- * npm Parser
- * Parses package.json and package-lock.json to extract dependencies
- */
-
+/** One npm dependency discovered from package.json or package-lock.json. */
 export interface ParsedDependency {
   name: string;
   version: string;
   isDirect: boolean;
   isDevDependency: boolean;
-  ecosystem: 'npm';
+  ecosystem: "npm";
 }
 
+/** Result returned by the npm dependency parser. */
 export interface NpmParseResult {
   dependencies: ParsedDependency[];
   totalCount: number;
@@ -22,173 +19,207 @@ export interface NpmParseResult {
   error?: string;
 }
 
+/** Parses npm manifests into normalized direct and transitive dependency records. */
 export class NpmParser {
   /**
-   * Parse npm project to extract all dependencies
+   * Parses package.json and package-lock.json to extract dependency records.
    */
   async parse(projectPath: string): Promise<NpmParseResult> {
     try {
-      const packageJsonPath = path.join(projectPath, 'package.json');
+      const packageJsonPath = path.join(projectPath, "package.json");
 
-      // Check if package.json exists
       if (!fs.existsSync(packageJsonPath)) {
         return {
           dependencies: [],
           totalCount: 0,
           directCount: 0,
           devCount: 0,
-          error: 'package.json not found'
+          error: "package.json not found",
         };
       }
 
-      // Read and parse package.json
-      const packageJsonContent = fs.readFileSync(packageJsonPath, 'utf-8');
-      const packageJson = JSON.parse(packageJsonContent);
-
+      const packageJson = readJsonObject(packageJsonPath);
+      const packageLockPath = path.join(projectPath, "package-lock.json");
+      const packageLock = fs.existsSync(packageLockPath) ? readJsonObject(packageLockPath) : null;
+      const lockedVersions = packageLock ? collectLockedVersions(packageLock) : new Map<string, string>();
       const dependencies: ParsedDependency[] = [];
 
-      // Parse production dependencies
-      if (packageJson.dependencies) {
-        for (const [name, version] of Object.entries(packageJson.dependencies)) {
-          dependencies.push({
-            name,
-            version: this.cleanVersion(version as string),
-            isDirect: true,
-            isDevDependency: false,
-            ecosystem: 'npm'
-          });
-        }
-      }
+      dependencies.push(
+        ...this.parseDirectDependencies(packageJson.dependencies, false, lockedVersions),
+        ...this.parseDirectDependencies(packageJson.devDependencies, true, lockedVersions),
+      );
 
-      // Parse dev dependencies
-      if (packageJson.devDependencies) {
-        for (const [name, version] of Object.entries(packageJson.devDependencies)) {
-          dependencies.push({
-            name,
-            version: this.cleanVersion(version as string),
-            isDirect: true,
-            isDevDependency: true,
-            ecosystem: 'npm'
-          });
-        }
-      }
-
-      // Try to parse package-lock.json for transitive dependencies
-      const packageLockPath = path.join(projectPath, 'package-lock.json');
-      if (fs.existsSync(packageLockPath)) {
-        const lockContent = fs.readFileSync(packageLockPath, 'utf-8');
-        const packageLock = JSON.parse(lockContent);
-
-        // Add transitive dependencies from lockfile
+      if (packageLock) {
         const transitiveDeps = this.parsePackageLock(packageLock, dependencies);
         dependencies.push(...transitiveDeps);
       }
 
-      // Calculate counts
-      const directCount = dependencies.filter(d => d.isDirect).length;
-      const devCount = dependencies.filter(d => d.isDevDependency).length;
+      const directCount = dependencies.filter((dependency) => dependency.isDirect).length;
+      const devCount = dependencies.filter((dependency) => dependency.isDevDependency).length;
 
       return {
         dependencies,
         totalCount: dependencies.length,
         directCount,
-        devCount
+        devCount,
       };
-
     } catch (error) {
-      console.error('npm parser error:', error);
       return {
         dependencies: [],
         totalCount: 0,
         directCount: 0,
         devCount: 0,
-        error: error instanceof Error ? error.message : 'Parse error'
+        error: error instanceof Error ? error.message : "Parse error",
       };
     }
   }
 
-  /**
-   * Parse package-lock.json to extract transitive dependencies
-   */
-  private parsePackageLock(packageLock: any, directDeps: ParsedDependency[]): ParsedDependency[] {
+  /** Converts direct dependency maps from package.json into normalized records. */
+  private parseDirectDependencies(
+    value: unknown,
+    isDevDependency: boolean,
+    lockedVersions: Map<string, string>,
+  ): ParsedDependency[] {
+    return Object.entries(asRecord(value))
+      .filter((entry): entry is [string, string] => typeof entry[1] === "string")
+      .map(([name, version]) => ({
+        name,
+        version: this.cleanVersion(lockedVersions.get(name) || version),
+        isDirect: true,
+        isDevDependency,
+        ecosystem: "npm",
+      }));
+  }
+
+  /** Extracts transitive dependencies from modern and legacy npm lockfile shapes. */
+  private parsePackageLock(packageLock: Record<string, unknown>, directDeps: ParsedDependency[]): ParsedDependency[] {
     const transitiveDeps: ParsedDependency[] = [];
-    const directDepNames = new Set(directDeps.map(d => d.name));
+    const directDepNames = new Set(directDeps.map((dependency) => dependency.name));
 
     try {
-      // package-lock.json v2/v3 format
-      if (packageLock.packages) {
-        for (const [pkgPath, pkgInfo] of Object.entries(packageLock.packages)) {
-          if (!pkgPath || pkgPath === '') continue; // Skip root
+      const packages = asRecord(packageLock.packages);
+      if (Object.keys(packages).length > 0) {
+        for (const [pkgPath, pkgInfo] of Object.entries(packages)) {
+          if (!pkgPath) continue;
 
-          const name = pkgPath.replace(/^node_modules\//, '').split('/node_modules/').pop() || '';
+          const name = packageNameFromLockPath(pkgPath);
 
-          // Skip if already in direct dependencies
           if (directDepNames.has(name)) continue;
 
-          const version = (pkgInfo as any).version;
-          if (name && version) {
+          const packageInfo = asRecord(pkgInfo);
+          const version = packageInfo.version;
+          if (name && typeof version === "string") {
             transitiveDeps.push({
               name,
               version: this.cleanVersion(version),
               isDirect: false,
-              isDevDependency: (pkgInfo as any).dev === true,
-              ecosystem: 'npm'
+              isDevDependency: packageInfo.dev === true,
+              ecosystem: "npm",
             });
           }
         }
-      }
-      // package-lock.json v1 format
-      else if (packageLock.dependencies) {
+      } else if (packageLock.dependencies) {
         this.extractV1Dependencies(packageLock.dependencies, directDepNames, transitiveDeps);
       }
-    } catch (error) {
-      console.error('Error parsing package-lock.json:', error);
+    } catch {
+      return transitiveDeps;
     }
 
     return transitiveDeps;
   }
 
-  /**
-   * Extract dependencies from package-lock.json v1 format (recursive)
-   */
+  /** Recursively extracts dependencies from npm v1 lockfile data. */
   private extractV1Dependencies(
-    deps: any,
+    deps: unknown,
     directDepNames: Set<string>,
-    result: ParsedDependency[]
+    result: ParsedDependency[],
   ): void {
-    for (const [name, info] of Object.entries(deps)) {
+    for (const [name, value] of Object.entries(asRecord(deps))) {
       if (directDepNames.has(name)) continue;
 
-      const version = (info as any).version;
-      if (version) {
+      const info = asRecord(value);
+      const version = info.version;
+      if (typeof version === "string") {
         result.push({
           name,
           version: this.cleanVersion(version),
           isDirect: false,
-          isDevDependency: (info as any).dev === true,
-          ecosystem: 'npm'
+          isDevDependency: info.dev === true,
+          ecosystem: "npm",
         });
       }
 
-      // Recursively process nested dependencies
-      if ((info as any).dependencies) {
-        this.extractV1Dependencies((info as any).dependencies, directDepNames, result);
+      if (info.dependencies) {
+        this.extractV1Dependencies(info.dependencies, directDepNames, result);
       }
     }
   }
 
-  /**
-   * Clean version string (remove ^, ~, >=, etc.)
-   */
+  /** Removes common package range prefixes so OSV receives a concrete version. */
   private cleanVersion(version: string): string {
-    // Remove version range symbols
-    return version.replace(/^[\^~>=<]+/, '').trim();
+    return version.replace(/^[\^~>=<]+/, "").trim();
   }
 
-  /**
-   * Check if a directory contains an npm project
-   */
+  /** Detects whether the path looks like an npm project root. */
   static isNpmProject(projectPath: string): boolean {
-    return fs.existsSync(path.join(projectPath, 'package.json'));
+    return fs.existsSync(path.join(projectPath, "package.json"));
   }
+}
+
+/** Reads JSON from disk and returns an object shape or an empty object. */
+function readJsonObject(filePath: string): Record<string, unknown> {
+  return asRecord(JSON.parse(fs.readFileSync(filePath, "utf8")));
+}
+
+/** Narrows unknown JSON values to plain object records. */
+function asRecord(value: unknown): Record<string, unknown> {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+
+  return {};
+}
+
+/** Collects resolved versions from npm lockfile package entries and legacy dependency entries. */
+function collectLockedVersions(packageLock: Record<string, unknown>): Map<string, string> {
+  const versions = new Map<string, string>();
+  const packages = asRecord(packageLock.packages);
+
+  if (Object.keys(packages).length > 0) {
+    for (const [pkgPath, pkgInfo] of Object.entries(packages)) {
+      if (!pkgPath) continue;
+
+      const packageInfo = asRecord(pkgInfo);
+      const version = packageInfo.version;
+      if (typeof version === "string") {
+        versions.set(packageNameFromLockPath(pkgPath), version);
+      }
+    }
+    return versions;
+  }
+
+  collectLegacyLockedVersions(packageLock.dependencies, versions);
+  return versions;
+}
+
+/** Recursively collects resolved versions from npm v1 lockfile dependencies. */
+function collectLegacyLockedVersions(deps: unknown, versions: Map<string, string>): void {
+  for (const [name, value] of Object.entries(asRecord(deps))) {
+    const info = asRecord(value);
+    const version = info.version;
+    if (typeof version === "string" && !versions.has(name)) {
+      versions.set(name, version);
+    }
+
+    if (info.dependencies) {
+      collectLegacyLockedVersions(info.dependencies, versions);
+    }
+  }
+}
+
+/** Extracts a package name from an npm lockfile path. */
+function packageNameFromLockPath(lockPath: string): string {
+  const normalized = lockPath.replace(/^node_modules\//, "");
+  const segments = normalized.split("/node_modules/");
+  return segments[segments.length - 1] || "";
 }

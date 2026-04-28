@@ -1,22 +1,31 @@
-import readline from "readline";
+import readline from "node:readline";
 import { DevGuardService } from "./service";
 import { RunInput } from "./types";
 import { DevGuardError, toErrorMessage } from "./errors";
 
+/** JSON-RPC id accepted by MCP requests and responses. */
 type JsonRpcId = string | number | null;
 
-type JsonRpcRequest = {
-  jsonrpc: "2.0";
-  id?: JsonRpcId;
-  method: string;
-  params?: unknown;
+/** Tool-call result format expected by MCP clients. */
+type McpToolResult = {
+  content: Array<{ type: "text"; text: string }>;
+  structuredContent: unknown;
+};
+
+/** Tool definition advertised through tools/list. */
+type McpToolDefinition = {
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
 };
 
 const SUPPORTED_PROTOCOL_VERSIONS = ["2025-03-26", "2024-11-05"];
 
+/** Implements the stdio MCP server that exposes DevGuard tools to agent clients. */
 export class McpServer {
   private initialized = false;
 
+  /** Creates an MCP server around a DevGuard service and JSON-RPC output writer. */
   constructor(
     private service: DevGuardService,
     private output: (payload: unknown) => void = (payload) => {
@@ -24,6 +33,7 @@ export class McpServer {
     },
   ) {}
 
+  /** Starts reading newline-delimited JSON-RPC messages from stdin. */
   start(): void {
     const rl = readline.createInterface({
       input: process.stdin,
@@ -34,8 +44,22 @@ export class McpServer {
       const trimmed = line.trim();
       if (!trimmed) return;
 
+      let message: unknown;
       try {
-        const message = JSON.parse(trimmed);
+        message = JSON.parse(trimmed);
+      } catch (error) {
+        this.output({
+          jsonrpc: "2.0",
+          id: null,
+          error: {
+            code: -32700,
+            message: toErrorMessage(error),
+          },
+        });
+        return;
+      }
+
+      try {
         if (Array.isArray(message)) {
           for (const item of message) {
             await this.handleMessage(item);
@@ -46,9 +70,9 @@ export class McpServer {
       } catch (error) {
         this.output({
           jsonrpc: "2.0",
-          id: null,
+          id: this.getJsonRpcId(this.asRecord(message).id),
           error: {
-            code: -32700,
+            code: -32603,
             message: toErrorMessage(error),
           },
         });
@@ -56,21 +80,24 @@ export class McpServer {
     });
   }
 
-  async handleMessage(message: JsonRpcRequest): Promise<void> {
-    if (message.jsonrpc !== "2.0" || typeof message.method !== "string") {
-      if (message.id !== undefined) {
-        this.sendError(message.id, -32600, "Invalid request");
-      }
+  /** Handles one parsed JSON-RPC request or notification. */
+  async handleMessage(message: unknown): Promise<void> {
+    const request = this.asRecord(message);
+    const hasId = Object.prototype.hasOwnProperty.call(request, "id");
+    const id = this.getJsonRpcId(request.id);
+    const method = typeof request.method === "string" ? request.method : "";
+
+    if (request.jsonrpc !== "2.0" || !method) {
+      this.sendError(hasId ? id : null, -32600, "Invalid request");
       return;
     }
 
-    if (message.method === "notifications/initialized") {
-      this.initialized = true;
+    if (method === "notifications/initialized") {
       return;
     }
 
-    if (message.method === "initialize") {
-      const params = this.asRecord(message.params);
+    if (method === "initialize") {
+      const params = this.asRecord(request.params);
       const requested = typeof params.protocolVersion === "string" ? params.protocolVersion : undefined;
       const protocolVersion = requested && SUPPORTED_PROTOCOL_VERSIONS.includes(requested)
         ? requested
@@ -78,7 +105,7 @@ export class McpServer {
       this.initialized = true;
       this.output({
         jsonrpc: "2.0",
-        id: message.id ?? null,
+        id,
         result: {
           protocolVersion,
           capabilities: {
@@ -93,20 +120,25 @@ export class McpServer {
       return;
     }
 
-    if (message.method === "ping") {
+    if (method === "ping") {
       this.output({
         jsonrpc: "2.0",
-        id: message.id ?? null,
+        id,
         result: {},
       });
       return;
     }
 
-    if (message.method === "tools/list") {
-      this.ensureInitialized(message.id ?? null);
+    if (method === "tools/list") {
+      try {
+        this.ensureInitialized(id);
+      } catch (error) {
+        this.sendError(id, -32002, toErrorMessage(error));
+        return;
+      }
       this.output({
         jsonrpc: "2.0",
-        id: message.id ?? null,
+        id,
         result: {
           tools: this.getTools(),
         },
@@ -114,22 +146,22 @@ export class McpServer {
       return;
     }
 
-    if (message.method === "tools/call") {
+    if (method === "tools/call") {
       try {
-        this.ensureInitialized(message.id ?? null);
-        const params = this.asRecord(message.params);
+        this.ensureInitialized(id);
+        const params = this.asRecord(request.params);
         const name = typeof params.name === "string" ? params.name : "";
         const args = this.asRecord(params.arguments);
         const result = await this.handleToolCall(name, args);
         this.output({
           jsonrpc: "2.0",
-          id: message.id ?? null,
+          id,
           result,
         });
       } catch (error) {
         this.output({
           jsonrpc: "2.0",
-          id: message.id ?? null,
+          id,
           result: {
             isError: true,
             content: [
@@ -144,17 +176,20 @@ export class McpServer {
       return;
     }
 
-    if (message.id !== undefined) {
-      this.sendError(message.id ?? null, -32601, `Method not found: ${message.method}`);
+    if (hasId) {
+      this.sendError(id, -32601, `Method not found: ${method}`);
     }
   }
 
-  private async handleToolCall(name: string, args: Record<string, unknown>) {
+  /** Dispatches an MCP tool call to the matching DevGuard service method. */
+  private async handleToolCall(name: string, args: Record<string, unknown>): Promise<McpToolResult> {
     switch (name) {
       case "run_full_review":
         return this.ok(await this.service.startFullReview(this.normalizeInput(args)), "Full review queued");
+      case "lint_code":
+        return this.ok(await this.service.startLintCode(this.normalizeInput(args)), "Lint queued");
       case "scan_code":
-        return this.ok(await this.service.startCodeScan(this.normalizeInput(args)), "Code scan queued");
+        return this.ok(await this.service.startLintCode(this.normalizeInput(args)), "Lint queued");
       case "scan_dependencies":
         return this.ok(await this.service.startDependencyScan(this.normalizeInput(args)), "Dependency scan queued");
       case "test_changes":
@@ -163,13 +198,16 @@ export class McpServer {
         return this.ok(this.service.getRunStatus(this.requireRunId(args)), "Run status");
       case "get_run_results":
         return this.ok(this.service.getRunResults(this.requireRunId(args)), "Run results");
+      case "commit_generated_tests":
+        return this.ok(await this.service.commitGeneratedTests(this.requireRunId(args)), "Generated tests committed");
       case "apply_generated_tests":
-        return this.ok(await this.service.applyGeneratedTests(this.requireRunId(args)), "Generated tests applied");
+        return this.ok(await this.service.commitGeneratedTests(this.requireRunId(args)), "Generated tests committed");
       default:
         throw new DevGuardError(`Unknown tool: ${name}`, "unknown_tool");
     }
   }
 
+  /** Normalizes MCP arguments into the internal run input shape. */
   private normalizeInput(args: Record<string, unknown>): RunInput {
     const gitTarget = args.git_target;
     if (gitTarget && !["latest-commit", "working-tree", "custom"].includes(String(gitTarget))) {
@@ -178,15 +216,16 @@ export class McpServer {
     if (String(gitTarget) === "custom" && typeof args.git_ref_or_range !== "string") {
       throw new DevGuardError("git_ref_or_range is required when git_target is custom", "missing_git_range");
     }
-    return {
-      repo_path: typeof args.repo_path === "string" ? args.repo_path : undefined,
-      git_target: gitTarget ? String(gitTarget) as RunInput["git_target"] : undefined,
-      git_ref_or_range: typeof args.git_ref_or_range === "string" ? args.git_ref_or_range : undefined,
-      prompt: typeof args.prompt === "string" ? args.prompt : undefined,
-      model: typeof args.model === "string" ? args.model : undefined,
-    };
+    const input: RunInput = {};
+    if (typeof args.repo_path === "string") input.repo_path = args.repo_path;
+    if (gitTarget) input.git_target = String(gitTarget) as NonNullable<RunInput["git_target"]>;
+    if (typeof args.git_ref_or_range === "string") input.git_ref_or_range = args.git_ref_or_range;
+    if (typeof args.prompt === "string") input.prompt = args.prompt;
+    if (typeof args.model === "string") input.model = args.model;
+    return input;
   }
 
+  /** Reads and validates a positive run id from MCP arguments. */
   private requireRunId(args: Record<string, unknown>): number {
     const runId = Number(args.run_id);
     if (!Number.isFinite(runId) || runId <= 0) {
@@ -195,7 +234,8 @@ export class McpServer {
     return runId;
   }
 
-  private ok(payload: unknown, label: string) {
+  /** Wraps a service payload in the MCP tool-result content format. */
+  private ok(payload: unknown, label: string): McpToolResult {
     return {
       content: [
         {
@@ -207,7 +247,8 @@ export class McpServer {
     };
   }
 
-  private getTools() {
+  /** Returns the public DevGuard tool definitions advertised over MCP. */
+  private getTools(): McpToolDefinition[] {
     const runInputSchema = {
       type: "object",
       properties: {
@@ -215,7 +256,7 @@ export class McpServer {
         git_target: {
           type: "string",
           enum: ["latest-commit", "working-tree", "custom"],
-          description: "Git target to inspect. Defaults to latest-commit.",
+          description: "Git target to inspect. test_changes defaults to working-tree; other tools default to latest-commit when they need git context.",
         },
         git_ref_or_range: { type: "string", description: "Commit id or range when git_target is custom." },
         prompt: { type: "string", description: "Extra human guidance for the run." },
@@ -226,28 +267,23 @@ export class McpServer {
 
     return [
       {
-        name: "run_full_review",
-        description: "Inspect git changes, generate tests in an ephemeral workspace, run tests, scan code, scan dependencies, and return a dashboard URL.",
+        name: "test_changes",
+        description: "Generate tests for current git changes and execute them in an ephemeral workspace. Defaults to working-tree.",
         inputSchema: runInputSchema,
       },
       {
-        name: "scan_code",
-        description: "Run deterministic code analysis for a Node/TypeScript repository.",
+        name: "lint_code",
+        description: "Run lint and static code checks for a Node/TypeScript repository.",
         inputSchema: runInputSchema,
       },
       {
         name: "scan_dependencies",
-        description: "Inventory Node dependencies and query OSV for vulnerability findings.",
-        inputSchema: runInputSchema,
-      },
-      {
-        name: "test_changes",
-        description: "Generate tests for git changes and execute them in an ephemeral workspace.",
+        description: "Inventory locked Node dependencies and produce a vulnerability/risk report.",
         inputSchema: runInputSchema,
       },
       {
         name: "get_run_status",
-        description: "Fetch the current status and progress log for a run.",
+        description: "Fetch the current status, progress log, and any available result details for a run.",
         inputSchema: {
           type: "object",
           properties: { run_id: { type: "number" } },
@@ -256,18 +292,8 @@ export class McpServer {
         },
       },
       {
-        name: "get_run_results",
-        description: "Fetch the final persisted results for a run.",
-        inputSchema: {
-          type: "object",
-          properties: { run_id: { type: "number" } },
-          required: ["run_id"],
-          additionalProperties: false,
-        },
-      },
-      {
-        name: "apply_generated_tests",
-        description: "Write generated test files from a prior run back into the repository. This is the only repo-mutating tool.",
+        name: "commit_generated_tests",
+        description: "Write generated test files from a prior run into the repository. This is the only repo-mutating tool and does not create a git commit.",
         inputSchema: {
           type: "object",
           properties: { run_id: { type: "number" } },
@@ -278,6 +304,7 @@ export class McpServer {
     ];
   }
 
+  /** Sends a JSON-RPC error response for protocol-level failures. */
   private sendError(id: JsonRpcId, code: number, message: string): void {
     this.output({
       jsonrpc: "2.0",
@@ -286,6 +313,7 @@ export class McpServer {
     });
   }
 
+  /** Ensures the client completed MCP initialization before tool access. */
   private ensureInitialized(id: JsonRpcId): void {
     if (this.initialized) {
       return;
@@ -299,11 +327,21 @@ export class McpServer {
     );
   }
 
+  /** Narrows unknown JSON values to plain object records for argument parsing. */
   private asRecord(value: unknown): Record<string, unknown> {
     if (value && typeof value === "object" && !Array.isArray(value)) {
       return value as Record<string, unknown>;
     }
 
     return {};
+  }
+
+  /** Normalizes unknown JSON-RPC id values to the allowed response id shape. */
+  private getJsonRpcId(value: unknown): JsonRpcId {
+    if (typeof value === "string" || typeof value === "number" || value === null) {
+      return value;
+    }
+
+    return null;
   }
 }

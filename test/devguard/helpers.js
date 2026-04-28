@@ -8,11 +8,12 @@ function createConfig(prefix = "devguard-test-") {
     baseDir,
     artifactsDir: path.join(baseDir, "artifacts"),
     dbPath: path.join(baseDir, "devgaurd.db"),
+    codexHome: path.join(baseDir, "codex-home"),
     dashboardHost: "127.0.0.1",
     dashboardPort: 4680,
     serverName: "devgaurd-mcp",
     serverVersion: "1.0.0",
-    defaultModel: "gpt-5.2-codex",
+    defaultModel: "gpt-5.2",
   };
 }
 

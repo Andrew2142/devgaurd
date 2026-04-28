@@ -1,8 +1,21 @@
-import fs from "fs";
-import os from "os";
-import path from "path";
-import { spawn, spawnSync } from "child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { CommandResult, runCommandAsync, runCommandSync, withEnv } from "../utils/process";
+import { CodexExecutableResolver } from "./codex-executable-resolver";
+import {
+  buildGenerationPrompt as buildGenerationPromptText,
+  buildPlanPrompt as buildPlanPromptText,
+} from "./codex-prompt-builder";
+import { GitContextService } from "./git-context-service";
+import {
+  validateGeneratedFilesPayload as validateGeneratedFilesPayloadShape,
+  validateGeneratedFileTargets as validateGeneratedFileTargetPaths,
+  validatePlanPayload as validatePlanPayloadShape,
+} from "./generated-test-validator";
+import { detectProjectProfile as detectProjectProfileFromFiles } from "./project-profile-service";
 
+/** Git metadata and diff content passed into Codex prompt builders. */
 export interface GitContext {
   mode: "latest-commit" | "working-tree" | "custom";
   resolvedRange: string;
@@ -15,6 +28,7 @@ export interface GitContext {
   diffTruncated: boolean;
 }
 
+/** Detected project ecosystem and test-command metadata. */
 export interface ProjectProfile {
   ecosystem: string;
   language: string;
@@ -26,6 +40,7 @@ export interface ProjectProfile {
   };
 }
 
+/** Result returned after a Codex CLI planning or generation pass. */
 export interface CodexPassResult<T> {
   status: number | null;
   signal: NodeJS.Signals | null;
@@ -39,9 +54,20 @@ export interface CodexPassResult<T> {
   command: string;
 }
 
+/** One generated file proposed by the Codex generation pass. */
 export interface GeneratedFilePayload {
   path: string;
   content: string;
+}
+
+/** Structured test plan emitted by the Codex planning pass. */
+export interface TestPlanPayload {
+  summary: string;
+  proposed_test_files: string[];
+  recommended_command: string;
+  risks: string[];
+  plan_text: string;
+  framework_guess?: string;
 }
 
 const DEFAULT_CODEX_TIMEOUT_MS = 300000;
@@ -58,39 +84,36 @@ const IGNORE_DIRS = new Set([
   "vendor",
 ]);
 
-const PLAN_SCHEMA_PATH = path.join(process.cwd(), "scripts", "schemas", "codex-test-plan.schema.json");
-const FILES_SCHEMA_PATH = path.join(process.cwd(), "scripts", "schemas", "codex-test-files.schema.json");
+const REPO_ROOT = path.resolve(__dirname, "..", "..");
+const PLAN_SCHEMA_PATH = path.join(REPO_ROOT, "scripts", "schemas", "codex-test-plan.schema.json");
+const FILES_SCHEMA_PATH = path.join(REPO_ROOT, "scripts", "schemas", "codex-test-files.schema.json");
 
-type CommandResult = {
-  status: number | null;
-  signal: NodeJS.Signals | null;
-  stdout: string;
-  stderr: string;
-  error: NodeJS.ErrnoException | null;
-};
-
+/** Runs Codex planning/generation passes and safely executes generated tests. */
 export class CodexRunnerService {
+  private readonly executableResolver = new CodexExecutableResolver();
+  private readonly gitContextService = new GitContextService(
+    (projectPath, args) => this.runGit(projectPath, args),
+    (projectPath, args) => this.runGitAsync(projectPath, args),
+  );
+
+  /** Creates a runner with optional Codex home isolation. */
+  constructor(private options: { codexHome?: string } = {}) {}
+
+  /** Resolves the Codex CLI binary used for planning and test generation. */
   resolveCodexExecutable(bin = "codex"): string | null {
-    if (bin && path.isAbsolute(bin) && fs.existsSync(bin)) {
-      return bin;
-    }
-
-    const direct = this.findExecutable(bin);
-    if (direct) {
-      return direct;
-    }
-
-    for (const candidate of this.collectCodexCandidates(bin)) {
-      if (fs.existsSync(candidate)) {
-        return candidate;
-      }
-    }
-
-    return null;
+    return this.executableResolver.resolveCodexExecutable(bin);
   }
 
+  /** Checks whether the resolved Codex CLI has an active login session. */
   checkCodexLogin(codexBin: string): { ok: boolean; output: string } {
-    const result = this.runCommand(codexBin, ["login", "status"], undefined, undefined, 30000);
+    const result = this.runCommand(
+      codexBin,
+      ["login", "status"],
+      undefined,
+      undefined,
+      30000,
+      this.getCodexEnv(),
+    );
     const output = `${result.stdout}\n${result.stderr}`.trim();
 
     return {
@@ -99,8 +122,16 @@ export class CodexRunnerService {
     };
   }
 
+  /** Checks Codex login state asynchronously for long-running MCP jobs. */
   async checkCodexLoginAsync(codexBin: string): Promise<{ ok: boolean; output: string }> {
-    const result = await this.runCommandAsync(codexBin, ["login", "status"], undefined, undefined, 30000);
+    const result = await this.runCommandAsync(
+      codexBin,
+      ["login", "status"],
+      undefined,
+      undefined,
+      30000,
+      this.getCodexEnv(),
+    );
     const output = `${result.stdout}\n${result.stderr}`.trim();
 
     return {
@@ -109,364 +140,37 @@ export class CodexRunnerService {
     };
   }
 
+  /** Verifies that the target path is inside a git work tree. */
   ensureGitRepo(projectPath: string): void {
-    const output = this.runGit(projectPath, ["rev-parse", "--is-inside-work-tree"]);
-    if (output !== "true") {
-      throw new Error("Target project is not inside a git work tree");
-    }
+    this.gitContextService.ensureGitRepo(projectPath);
   }
 
+  /** Collects git diff metadata for the requested target in synchronous workflows. */
   getGitContext(
     projectPath: string,
     gitTarget: "latest-commit" | "working-tree" | "custom",
     gitRange?: string,
     maxDiffChars = DEFAULT_MAX_DIFF_CHARS,
   ): GitContext {
-    this.ensureGitRepo(projectPath);
-
-    if (gitTarget === "latest-commit") {
-      const head = this.runGit(projectPath, ["rev-parse", "HEAD"]);
-      let base: string;
-
-      try {
-        base = this.runGit(projectPath, ["rev-parse", "HEAD~1"]);
-      } catch {
-        throw new Error("Latest-commit mode requires at least two commits");
-      }
-
-      const changedFiles = this.runGit(projectPath, ["diff", "--name-only", `${base}..${head}`])
-        .split("\n")
-        .map((line) => line.trim())
-        .filter(Boolean);
-      const diff = this.runGit(projectPath, ["diff", "--unified=3", `${base}..${head}`]);
-      const summary = this.runGit(projectPath, ["show", "--stat", "--summary", "--format=fuller", head]);
-
-      return {
-        mode: gitTarget,
-        resolvedRange: `${base}..${head}`,
-        head,
-        base,
-        changedFiles,
-        changedTestFiles: changedFiles.filter((filePath) => this.isTestLikePath(filePath)),
-        summary,
-        diff: diff.slice(0, maxDiffChars),
-        diffTruncated: diff.length > maxDiffChars,
-      };
-    }
-
-    if (gitTarget === "working-tree") {
-      const stagedFiles = this.runGit(projectPath, ["diff", "--cached", "--name-only"])
-        .split("\n")
-        .map((line) => line.trim())
-        .filter(Boolean);
-      const unstagedFiles = this.runGit(projectPath, ["diff", "--name-only"])
-        .split("\n")
-        .map((line) => line.trim())
-        .filter(Boolean);
-      const changedFiles = Array.from(new Set([...stagedFiles, ...unstagedFiles]));
-
-      if (changedFiles.length === 0) {
-        throw new Error("Working-tree mode requires staged or unstaged changes");
-      }
-
-      const stagedDiff = this.runGit(projectPath, ["diff", "--cached", "--unified=3"]);
-      const unstagedDiff = this.runGit(projectPath, ["diff", "--unified=3"]);
-
-      return {
-        mode: gitTarget,
-        resolvedRange: "working-tree",
-        head: this.runGit(projectPath, ["rev-parse", "HEAD"]),
-        base: null,
-        changedFiles,
-        changedTestFiles: changedFiles.filter((filePath) => this.isTestLikePath(filePath)),
-        summary: this.runGit(projectPath, ["status", "--short"]),
-        diff: [
-          "### STAGED DIFF ###",
-          stagedDiff || "(none)",
-          "",
-          "### UNSTAGED DIFF ###",
-          unstagedDiff || "(none)",
-        ].join("\n").slice(0, maxDiffChars),
-        diffTruncated: (stagedDiff.length + unstagedDiff.length) > maxDiffChars,
-      };
-    }
-
-    if (!gitRange) {
-      throw new Error("Custom git range is required");
-    }
-
-    const resolvedRange = gitRange.includes("..") ? gitRange : `${gitRange}^..${gitRange}`;
-    const changedFiles = this.runGit(projectPath, ["diff", "--name-only", resolvedRange])
-      .split("\n")
-      .map((line) => line.trim())
-      .filter(Boolean);
-
-    if (changedFiles.length === 0) {
-      throw new Error(`Custom git range produced no changed files: ${resolvedRange}`);
-    }
-
-    const diff = this.runGit(projectPath, ["diff", "--unified=3", resolvedRange]);
-    const summary = this.runGit(projectPath, ["show", "--stat", "--summary", "--format=fuller", resolvedRange]);
-    const [base, head] = resolvedRange.split("..");
-
-    return {
-      mode: gitTarget,
-      resolvedRange,
-      head: head || gitRange,
-      base: base || null,
-      changedFiles,
-      changedTestFiles: changedFiles.filter((filePath) => this.isTestLikePath(filePath)),
-      summary,
-      diff: diff.slice(0, maxDiffChars),
-      diffTruncated: diff.length > maxDiffChars,
-    };
+    return this.gitContextService.getGitContext(projectPath, gitTarget, gitRange, maxDiffChars);
   }
 
+  /** Collects git diff metadata for the requested target in asynchronous workflows. */
   async getGitContextAsync(
     projectPath: string,
     gitTarget: "latest-commit" | "working-tree" | "custom",
     gitRange?: string,
     maxDiffChars = DEFAULT_MAX_DIFF_CHARS,
   ): Promise<GitContext> {
-    await this.ensureGitRepoAsync(projectPath);
-
-    if (gitTarget === "latest-commit") {
-      const head = await this.runGitAsync(projectPath, ["rev-parse", "HEAD"]);
-      let base: string;
-
-      try {
-        base = await this.runGitAsync(projectPath, ["rev-parse", "HEAD~1"]);
-      } catch {
-        throw new Error("Latest-commit mode requires at least two commits");
-      }
-
-      const changedFiles = (await this.runGitAsync(projectPath, ["diff", "--name-only", `${base}..${head}`]))
-        .split("\n")
-        .map((line) => line.trim())
-        .filter(Boolean);
-      const diff = await this.runGitAsync(projectPath, ["diff", "--unified=3", `${base}..${head}`]);
-      const summary = await this.runGitAsync(projectPath, ["show", "--stat", "--summary", "--format=fuller", head]);
-
-      return {
-        mode: gitTarget,
-        resolvedRange: `${base}..${head}`,
-        head,
-        base,
-        changedFiles,
-        changedTestFiles: changedFiles.filter((filePath) => this.isTestLikePath(filePath)),
-        summary,
-        diff: diff.slice(0, maxDiffChars),
-        diffTruncated: diff.length > maxDiffChars,
-      };
-    }
-
-    if (gitTarget === "working-tree") {
-      const stagedFiles = (await this.runGitAsync(projectPath, ["diff", "--cached", "--name-only"]))
-        .split("\n")
-        .map((line) => line.trim())
-        .filter(Boolean);
-      const unstagedFiles = (await this.runGitAsync(projectPath, ["diff", "--name-only"]))
-        .split("\n")
-        .map((line) => line.trim())
-        .filter(Boolean);
-      const changedFiles = Array.from(new Set([...stagedFiles, ...unstagedFiles]));
-
-      if (changedFiles.length === 0) {
-        throw new Error("Working-tree mode requires staged or unstaged changes");
-      }
-
-      const stagedDiff = await this.runGitAsync(projectPath, ["diff", "--cached", "--unified=3"]);
-      const unstagedDiff = await this.runGitAsync(projectPath, ["diff", "--unified=3"]);
-
-      return {
-        mode: gitTarget,
-        resolvedRange: "working-tree",
-        head: await this.runGitAsync(projectPath, ["rev-parse", "HEAD"]),
-        base: null,
-        changedFiles,
-        changedTestFiles: changedFiles.filter((filePath) => this.isTestLikePath(filePath)),
-        summary: await this.runGitAsync(projectPath, ["status", "--short"]),
-        diff: [
-          "### STAGED DIFF ###",
-          stagedDiff || "(none)",
-          "",
-          "### UNSTAGED DIFF ###",
-          unstagedDiff || "(none)",
-        ].join("\n").slice(0, maxDiffChars),
-        diffTruncated: (stagedDiff.length + unstagedDiff.length) > maxDiffChars,
-      };
-    }
-
-    if (!gitRange) {
-      throw new Error("Custom git range is required");
-    }
-
-    const resolvedRange = this.normalizeCustomGitRange(gitRange);
-    const changedFiles = (await this.runGitAsync(projectPath, ["diff", "--name-only", resolvedRange]))
-      .split("\n")
-      .map((line) => line.trim())
-      .filter(Boolean);
-
-    if (changedFiles.length === 0) {
-      throw new Error(`Custom git range produced no changed files: ${resolvedRange}`);
-    }
-
-    const diff = await this.runGitAsync(projectPath, ["diff", "--unified=3", resolvedRange]);
-    const summary = await this.runGitAsync(projectPath, ["show", "--stat", "--summary", "--format=fuller", resolvedRange]);
-    const [base, head] = resolvedRange.split("..");
-
-    return {
-      mode: gitTarget,
-      resolvedRange,
-      head: head || gitRange,
-      base: base || null,
-      changedFiles,
-      changedTestFiles: changedFiles.filter((filePath) => this.isTestLikePath(filePath)),
-      summary,
-      diff: diff.slice(0, maxDiffChars),
-      diffTruncated: diff.length > maxDiffChars,
-    };
+    return this.gitContextService.getGitContextAsync(projectPath, gitTarget, gitRange, maxDiffChars);
   }
 
-  private normalizeCustomGitRange(gitRange: string): string {
-    const trimmed = gitRange.trim();
-    if (!trimmed) {
-      throw new Error("Custom git range is required");
-    }
-
-    if (trimmed.includes("..")) {
-      return trimmed;
-    }
-
-    const commitIds = trimmed
-      .split(/[\s,]+/)
-      .map((value) => value.trim())
-      .filter(Boolean);
-
-    if (commitIds.length === 0) {
-      throw new Error("Custom git range is required");
-    }
-
-    if (commitIds.length === 1) {
-      return `${commitIds[0]}^..${commitIds[0]}`;
-    }
-
-    return `${commitIds[0]}^..${commitIds[commitIds.length - 1]}`;
-  }
-
+  /** Detects the repository ecosystem, package manager, and test command. */
   detectProjectProfile(projectPath: string): ProjectProfile {
-    const packageJsonPath = path.join(projectPath, "package.json");
-    const composerJsonPath = path.join(projectPath, "composer.json");
-    const pyprojectPath = path.join(projectPath, "pyproject.toml");
-    const goModPath = path.join(projectPath, "go.mod");
-    const cargoTomlPath = path.join(projectPath, "Cargo.toml");
-    const pomXmlPath = path.join(projectPath, "pom.xml");
-
-    if (fs.existsSync(packageJsonPath)) {
-      const pkg = JSON.parse(fs.readFileSync(packageJsonPath, "utf8"));
-      const packageManager = fs.existsSync(path.join(projectPath, "pnpm-lock.yaml"))
-        ? "pnpm"
-        : fs.existsSync(path.join(projectPath, "yarn.lock"))
-          ? "yarn"
-          : "npm";
-      const scriptCommand = pkg.scripts && typeof pkg.scripts.test === "string"
-        ? `${packageManager} test`
-        : null;
-      const inferredCommand = scriptCommand
-        || (pkg.devDependencies && pkg.devDependencies.vitest ? `${packageManager} exec vitest run` : null)
-        || (pkg.devDependencies && pkg.devDependencies.jest ? `${packageManager} exec jest --runInBand` : null)
-        || null;
-
-      return {
-        ecosystem: "node",
-        language: "javascript/typescript",
-        packageManager,
-        command: inferredCommand,
-        packageSummary: {
-          name: pkg.name || path.basename(projectPath),
-          scripts: pkg.scripts || {},
-        },
-      };
-    }
-
-    if (fs.existsSync(composerJsonPath)) {
-      const composer = JSON.parse(fs.readFileSync(composerJsonPath, "utf8"));
-      const inferredCommand = composer.scripts && composer.scripts.test
-        ? "composer test"
-        : fs.existsSync(path.join(projectPath, "vendor", "bin", "pest"))
-          ? "vendor/bin/pest"
-          : fs.existsSync(path.join(projectPath, "vendor", "bin", "phpunit"))
-            ? "vendor/bin/phpunit"
-            : null;
-
-      return {
-        ecosystem: "php",
-        language: "php",
-        packageManager: "composer",
-        command: inferredCommand,
-        packageSummary: {
-          name: composer.name || path.basename(projectPath),
-        },
-      };
-    }
-
-    if (fs.existsSync(pyprojectPath) || fs.existsSync(path.join(projectPath, "requirements.txt"))) {
-      return {
-        ecosystem: "python",
-        language: "python",
-        packageManager: "pip",
-        command: fs.existsSync(path.join(projectPath, "pytest.ini")) || fs.existsSync(path.join(projectPath, "tests"))
-          ? "pytest"
-          : "python -m unittest",
-        packageSummary: {
-          name: path.basename(projectPath),
-        },
-      };
-    }
-
-    if (fs.existsSync(pomXmlPath)) {
-      return {
-        ecosystem: "java",
-        language: "java",
-        packageManager: "maven",
-        command: "mvn test",
-        packageSummary: { name: path.basename(projectPath) },
-      };
-    }
-
-    if (fs.existsSync(goModPath)) {
-      return {
-        ecosystem: "go",
-        language: "go",
-        packageManager: "go",
-        command: "go test ./...",
-        packageSummary: { name: path.basename(projectPath) },
-      };
-    }
-
-    if (fs.existsSync(cargoTomlPath)) {
-      return {
-        ecosystem: "rust",
-        language: "rust",
-        packageManager: "cargo",
-        command: "cargo test",
-        packageSummary: { name: path.basename(projectPath) },
-      };
-    }
-
-    return {
-      ecosystem: "unknown",
-      language: "unknown",
-      packageManager: "unknown",
-      command: null,
-      packageSummary: {
-        name: path.basename(projectPath),
-      },
-    };
+    return detectProjectProfileFromFiles(projectPath);
   }
 
- 
-
+  /** Builds the read-only prompt that asks Codex to plan test coverage. */
   buildPlanPrompt(context: {
     projectName: string;
     projectProfile: ProjectProfile;
@@ -475,57 +179,10 @@ export class CodexRunnerService {
     notes: string;
     testCommand: string | null;
   }): string {
-    const brief = context.brief || "(none)";
-    const notes = context.notes || "(none)";
-    const testCommand = context.testCommand || "(not detected)";
-     
-
-    return `You are helping with a backend spike for a local Codex-driven code tester.
-
-Analyze the git change set and propose test coverage only. Do not modify files. Do not include markdown fences.
-The final plan_text should focus on what behaviours, edge cases, regressions, and risks need coverage.
-Do not make the plan_text read like implementation instructions, file-edit steps, or framework mechanics.
-
-Project:
-- Name: ${context.projectName}
-- Ecosystem: ${context.projectProfile.ecosystem}
-- Language: ${context.projectProfile.language}
-- Package manager: ${context.projectProfile.packageManager}
-- Detected test command: ${testCommand}
-
-Git target:
-- Mode: ${context.git.mode}
-- Resolved range: ${context.git.resolvedRange}
-- Changed files count: ${context.git.changedFiles.length}
-- Changed test files count: ${context.git.changedTestFiles.length}
-
-Saved testing brief:
-${brief}
-
-Specific testing focus from the user:
-${notes}
-
- 
-
-Git summary:
-${context.git.summary}
-
-Changed files:
-${context.git.changedFiles.join("\n")}
-
-Diff excerpt:
-${context.git.diff}
-
-Return JSON only with:
-- summary: string
-- proposed_test_files: string[]
-- recommended_command: string
-- risks: string[]
-- plan_text: string
-- framework_guess: string
-`;
+    return buildPlanPromptText(context);
   }
 
+  /** Builds the prompt that asks Codex to emit generated test files as JSON. */
   buildGenerationPrompt(context: {
     projectName: string;
     projectProfile: ProjectProfile;
@@ -537,50 +194,17 @@ Return JSON only with:
       proposed_test_files: string[];
     };
   }): string {
- 
-    return `You are generating tests for a local Codex spike.
-
-Hard rules:
-- Return JSON only. No markdown fences.
-- Do not modify or propose production source files.
-- Only generate new or updated test files.
-- Keep file paths relative to the repository root.
-- Prefer the established test style and naming conventions already present in the repo.
-
-Project:
-- Name: ${context.projectName}
-- Ecosystem: ${context.projectProfile.ecosystem}
-- Language: ${context.projectProfile.language}
-- Package manager: ${context.projectProfile.packageManager}
-- Test command: ${context.testCommand || "(not detected)"}
-
-Confirmed plan:
-${context.plan.plan_text}
-
-Plan summary:
-${context.plan.summary}
-
-Suggested files:
-${context.plan.proposed_test_files.join("\n")}
-
-Changed files:
-${context.git.changedFiles.join("\n")}
-
-Diff excerpt:
-${context.git.diff}
-
-Return JSON only with:
-- files: array of { path: string, content: string }
-`;
+    return buildGenerationPromptText(context);
   }
 
+  /** Runs the synchronous Codex planning pass and parses the schema-constrained output. */
   runPlanPass(params: {
     codexBin: string;
     model: string;
     projectPath: string;
     prompt: string;
     timeoutMs?: number;
-  }): CodexPassResult<any> {
+  }): CodexPassResult<unknown> {
     return this.runCodexPass({
       codexBin: params.codexBin,
       model: params.model,
@@ -592,13 +216,14 @@ Return JSON only with:
     });
   }
 
+  /** Runs the asynchronous Codex planning pass and parses the schema-constrained output. */
   async runPlanPassAsync(params: {
     codexBin: string;
     model: string;
     projectPath: string;
     prompt: string;
     timeoutMs?: number;
-  }): Promise<CodexPassResult<any>> {
+  }): Promise<CodexPassResult<unknown>> {
     return this.runCodexPassAsync({
       codexBin: params.codexBin,
       model: params.model,
@@ -610,6 +235,7 @@ Return JSON only with:
     });
   }
 
+  /** Runs the synchronous Codex generation pass and parses generated test-file JSON. */
   runGenerationPass(params: {
     codexBin: string;
     model: string;
@@ -617,7 +243,7 @@ Return JSON only with:
     prompt: string;
     timeoutMs?: number;
     skipGitRepoCheck?: boolean;
-  }): CodexPassResult<any> {
+  }): CodexPassResult<unknown> {
     return this.runCodexPass({
       codexBin: params.codexBin,
       model: params.model,
@@ -630,6 +256,7 @@ Return JSON only with:
     });
   }
 
+  /** Runs the asynchronous Codex generation pass and parses generated test-file JSON. */
   async runGenerationPassAsync(params: {
     codexBin: string;
     model: string;
@@ -637,7 +264,7 @@ Return JSON only with:
     prompt: string;
     timeoutMs?: number;
     skipGitRepoCheck?: boolean;
-  }): Promise<CodexPassResult<any>> {
+  }): Promise<CodexPassResult<unknown>> {
     return this.runCodexPassAsync({
       codexBin: params.codexBin,
       model: params.model,
@@ -650,110 +277,22 @@ Return JSON only with:
     });
   }
 
-  validatePlanPayload(payload: any): string[] {
-    const errors: string[] = [];
-
-    if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
-      return ["Plan payload must be a JSON object"];
-    }
-
-    if (typeof payload.summary !== "string" || payload.summary.trim() === "") {
-      errors.push("summary must be a non-empty string");
-    }
-
-    if (!Array.isArray(payload.proposed_test_files) || payload.proposed_test_files.some((item: unknown) => typeof item !== "string")) {
-      errors.push("proposed_test_files must be an array of strings");
-    }
-
-    if (typeof payload.recommended_command !== "string" || payload.recommended_command.trim() === "") {
-      errors.push("recommended_command must be a non-empty string");
-    }
-
-    if (!Array.isArray(payload.risks) || payload.risks.some((item: unknown) => typeof item !== "string")) {
-      errors.push("risks must be an array of strings");
-    }
-
-    if (typeof payload.plan_text !== "string" || payload.plan_text.trim() === "") {
-      errors.push("plan_text must be a non-empty string");
-    }
-
-    if (payload.framework_guess != null && typeof payload.framework_guess !== "string") {
-      errors.push("framework_guess must be a string when provided");
-    }
-
-    return errors;
+  /** Validates a Codex planning response before the service trusts its fields. */
+  validatePlanPayload(payload: unknown): string[] {
+    return validatePlanPayloadShape(payload);
   }
 
-  validateGeneratedFilesPayload(payload: any): { errors: string[]; files: GeneratedFilePayload[] } {
-    const errors: string[] = [];
-
-    if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
-      return { errors: ["Generated files payload must be a JSON object"], files: [] };
-    }
-
-    if (!Array.isArray(payload.files) || payload.files.length === 0) {
-      return { errors: ["files must be a non-empty array"], files: [] };
-    }
-
-    const normalizedFiles: GeneratedFilePayload[] = [];
-
-    for (const file of payload.files) {
-      if (!file || typeof file !== "object" || Array.isArray(file)) {
-        errors.push("Each file entry must be an object");
-        continue;
-      }
-
-      if (typeof file.path !== "string" || file.path.trim() === "") {
-        errors.push("Each file path must be a non-empty string");
-        continue;
-      }
-
-      if (typeof file.content !== "string" || file.content.trim() === "") {
-        errors.push(`Generated file ${file.path} has empty content`);
-        continue;
-      }
-
-      normalizedFiles.push({
-        path: file.path.trim().replace(/\\/g, "/"),
-        content: file.content,
-      });
-    }
-
-    return { errors, files: normalizedFiles };
+  /** Validates and normalizes generated test files returned by Codex. */
+  validateGeneratedFilesPayload(payload: unknown): { errors: string[]; files: GeneratedFilePayload[] } {
+    return validateGeneratedFilesPayloadShape(payload);
   }
 
+  /** Accepts only generated files that stay inside known test-only locations. */
   validateGeneratedFileTargets(projectRoot: string, ecosystem: string, files: GeneratedFilePayload[]) {
-    const allowedPatterns = this.getAllowedPatterns(ecosystem);
-    const accepted: Array<{ path: string; absolutePath: string; content: string }> = [];
-    const rejected: Array<{ path: string; reason: string }> = [];
-    const resolvedProjectRoot = path.resolve(projectRoot);
-
-    for (const file of files) {
-      const relativePath = file.path.replace(/^\.?\//, "");
-      const resolved = path.resolve(resolvedProjectRoot, relativePath);
-      const isInsideRoot = resolved === resolvedProjectRoot || resolved.startsWith(`${resolvedProjectRoot}${path.sep}`);
-      const matchesAllowedPattern = allowedPatterns.some((pattern) => pattern.test(relativePath));
-
-      if (path.isAbsolute(file.path) || !isInsideRoot || relativePath === "") {
-        rejected.push({ path: file.path, reason: "Path escapes the repository root or is absolute" });
-        continue;
-      }
-
-      if (!matchesAllowedPattern) {
-        rejected.push({ path: file.path, reason: "Path is not a recognized test-only location" });
-        continue;
-      }
-
-      accepted.push({
-        path: relativePath,
-        absolutePath: resolved,
-        content: file.content,
-      });
-    }
-
-    return { accepted, rejected };
+    return validateGeneratedFileTargetPaths(projectRoot, ecosystem, files);
   }
 
+  /** Copies a repository into a temporary workspace while excluding heavy generated directories. */
   createEphemeralWorkspace(projectPath: string): string {
     const workspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), "devgaurd-code-tester-"));
     const destination = path.join(workspaceRoot, path.basename(projectPath));
@@ -766,13 +305,32 @@ Return JSON only with:
         return !rel.split(path.sep).some((segment) => IGNORE_DIRS.has(segment));
       },
     });
+    this.linkNodeModulesIfAvailable(projectPath, destination);
     return destination;
   }
 
+  /** Links local dependencies into the ephemeral workspace so test commands can use dev tools. */
+  private linkNodeModulesIfAvailable(projectPath: string, destination: string): void {
+    const sourceNodeModules = path.join(projectPath, "node_modules");
+    const destinationNodeModules = path.join(destination, "node_modules");
+    if (!fs.existsSync(sourceNodeModules) || fs.existsSync(destinationNodeModules)) {
+      return;
+    }
+
+    try {
+      fs.symlinkSync(sourceNodeModules, destinationNodeModules, "junction");
+    } catch {
+      // Best effort: repositories without installed dependencies will report the
+      // missing tool through the normal test command output.
+    }
+  }
+
+  /** Removes the temporary workspace created for generated test execution. */
   cleanupWorkspace(workspacePath: string): void {
     fs.rmSync(path.dirname(workspacePath), { recursive: true, force: true });
   }
 
+  /** Writes accepted generated test files into a workspace or repository. */
   writeAcceptedFiles(
     workspacePath: string,
     acceptedFiles: Array<{ path: string; content: string }>,
@@ -789,6 +347,7 @@ Return JSON only with:
     return writtenFiles;
   }
 
+  /** Runs a repository test command through the user's shell and extracts a compact summary. */
   runTestCommand(projectPath: string, commandText: string, timeoutMs = DEFAULT_TEST_TIMEOUT_MS) {
     const shell = process.env.SHELL || "/bin/bash";
     const startedMs = Date.now();
@@ -806,6 +365,7 @@ Return JSON only with:
     };
   }
 
+  /** Runs a repository test command asynchronously and extracts a compact summary. */
   async runTestCommandAsync(projectPath: string, commandText: string, timeoutMs = DEFAULT_TEST_TIMEOUT_MS) {
     const shell = process.env.SHELL || "/bin/bash";
     const startedMs = Date.now();
@@ -823,6 +383,7 @@ Return JSON only with:
     };
   }
 
+  /** Executes a Codex pass synchronously and loads the JSON message written by the CLI. */
   private runCodexPass(params: {
     codexBin: string;
     model: string;
@@ -832,7 +393,7 @@ Return JSON only with:
     timeoutMs: number;
     label: string;
     skipGitRepoCheck?: boolean;
-  }): CodexPassResult<any> {
+  }): CodexPassResult<unknown> {
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-local-runner-"));
     const outputFile = path.join(tempDir, `${params.label}-last-message.json`);
     const args = [
@@ -840,6 +401,8 @@ Return JSON only with:
       ...(params.model ? ["-m", params.model] : []),
       "--json",
       "--ephemeral",
+      "--ignore-user-config",
+      "--ignore-rules",
       ...(params.skipGitRepoCheck ? ["--skip-git-repo-check"] : []),
       "--sandbox",
       "read-only",
@@ -853,9 +416,16 @@ Return JSON only with:
     ];
 
     const startedMs = Date.now();
-    const result = this.runCommand(params.codexBin, args, params.projectPath, params.prompt, params.timeoutMs);
+    const result = this.runCommand(
+      params.codexBin,
+      args,
+      params.projectPath,
+      params.prompt,
+      params.timeoutMs,
+      this.getCodexEnv(),
+    );
     const outputText = fs.existsSync(outputFile) ? fs.readFileSync(outputFile, "utf8").trim() : "";
-    let payload: any = null;
+    let payload: unknown = null;
     let parseError: string | null = null;
 
     if (outputText) {
@@ -882,6 +452,7 @@ Return JSON only with:
     };
   }
 
+  /** Executes a Codex pass asynchronously and loads the JSON message written by the CLI. */
   private async runCodexPassAsync(params: {
     codexBin: string;
     model: string;
@@ -891,7 +462,7 @@ Return JSON only with:
     timeoutMs: number;
     label: string;
     skipGitRepoCheck?: boolean;
-  }): Promise<CodexPassResult<any>> {
+  }): Promise<CodexPassResult<unknown>> {
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-local-runner-"));
     const outputFile = path.join(tempDir, `${params.label}-last-message.json`);
     const args = [
@@ -899,6 +470,8 @@ Return JSON only with:
       ...(params.model ? ["-m", params.model] : []),
       "--json",
       "--ephemeral",
+      "--ignore-user-config",
+      "--ignore-rules",
       ...(params.skipGitRepoCheck ? ["--skip-git-repo-check"] : []),
       "--sandbox",
       "read-only",
@@ -912,9 +485,16 @@ Return JSON only with:
     ];
 
     const startedMs = Date.now();
-    const result = await this.runCommandAsync(params.codexBin, args, params.projectPath, params.prompt, params.timeoutMs);
+    const result = await this.runCommandAsync(
+      params.codexBin,
+      args,
+      params.projectPath,
+      params.prompt,
+      params.timeoutMs,
+      this.getCodexEnv(),
+    );
     const outputText = fs.existsSync(outputFile) ? fs.readFileSync(outputFile, "utf8").trim() : "";
-    let payload: any = null;
+    let payload: unknown = null;
     let parseError: string | null = null;
 
     if (outputText) {
@@ -941,6 +521,7 @@ Return JSON only with:
     };
   }
 
+  /** Maps Codex process failures into stable categories for diagnostics. */
   private classifyCodexFailure(output: CommandResult): string {
     if (output.error?.code === "ETIMEDOUT") {
       return "timeout";
@@ -978,6 +559,7 @@ Return JSON only with:
     return "execution";
   }
 
+  /** Extracts common passed, failed, and skipped counts from test runner output. */
   private extractTestSummary(output: string) {
     const normalized = output.replace(/\x1B\[[0-9;]*m/g, "");
     const summary = {
@@ -998,108 +580,7 @@ Return JSON only with:
     return summary;
   }
 
- 
-  private isTestLikePath(filePath: string): boolean {
-    return /(^|\/)(tests?|__tests__)\/|(\.test\.|\.spec\.)|Test\.php$|_test\.go$|(^|\/)src\/test\//i.test(filePath);
-  }
-
-  private getAllowedPatterns(ecosystem: string): RegExp[] {
-    switch (ecosystem) {
-      case "node":
-        return [/(\btests?\b|__tests__)\/.+/i, /.+\.(test|spec)\.[^.]+$/i];
-      case "php":
-        return [/(^|\/)tests\/.+/i, /.+Test\.php$/i];
-      case "python":
-        return [/(^|\/)tests\/.+\.py$/i, /(^|\/)test_[^/]+\.py$/i, /.+_test\.py$/i];
-      case "java":
-        return [/^src\/test\/.+/i];
-      case "go":
-        return [/.+_test\.go$/i];
-      case "rust":
-        return [/^tests\/.+/i];
-      default:
-        return [
-          /(\btests?\b|__tests__)\/.+/i,
-          /.+\.(test|spec)\.[^.]+$/i,
-          /.+Test\.php$/i,
-          /.+_test\.go$/i,
-          /^src\/test\/.+/i,
-        ];
-    }
-  }
-
-  private collectCodexCandidates(bin: string): string[] {
-    const candidates: string[] = [];
-
-    if (bin && bin !== "codex") {
-      candidates.push(this.expandHome(bin));
-    }
-
-    if (process.env.CODEX_BIN) {
-      candidates.push(this.expandHome(process.env.CODEX_BIN));
-    }
-
-    const pathEntries = (process.env.PATH || "")
-      .split(path.delimiter)
-      .map((entry) => entry.trim())
-      .filter(Boolean);
-
-    for (const entry of pathEntries) {
-      candidates.push(path.join(entry, "codex"));
-    }
-
-    const home = os.homedir();
-    const commonRoots = [
-      path.join(home, ".vscode", "extensions"),
-      path.join(home, ".vscode-insiders", "extensions"),
-      path.join(home, ".cursor", "extensions"),
-    ];
-
-    for (const root of commonRoots) {
-      if (!fs.existsSync(root)) continue;
-
-      let extensionDirs: string[] = [];
-      try {
-        extensionDirs = fs.readdirSync(root);
-      } catch {
-        continue;
-      }
-
-      for (const dir of extensionDirs) {
-        if (!/openai\.chatgpt/i.test(dir)) continue;
-        candidates.push(path.join(root, dir, "bin", "linux-x86_64", "codex"));
-        candidates.push(path.join(root, dir, "bin", "darwin-aarch64", "codex"));
-        candidates.push(path.join(root, dir, "bin", "darwin-x86_64", "codex"));
-        candidates.push(path.join(root, dir, "bin", "win32-x86_64", "codex.exe"));
-      }
-    }
-
-    return Array.from(new Set(candidates.map((candidate) => this.expandHome(candidate)).filter(Boolean)));
-  }
-
-  private expandHome(filePath: string): string {
-    if (filePath === "~") return os.homedir();
-    if (filePath.startsWith("~/")) {
-      return path.join(os.homedir(), filePath.slice(2));
-    }
-    return filePath;
-  }
-
-  private findExecutable(bin: string): string | null {
-    const result = this.runCommand("which", [bin], undefined, undefined, 10000);
-    if (result.status !== 0) {
-      return null;
-    }
-    return result.stdout.trim() || null;
-  }
-
-  private async ensureGitRepoAsync(projectPath: string): Promise<void> {
-    const output = await this.runGitAsync(projectPath, ["rev-parse", "--is-inside-work-tree"]);
-    if (output !== "true") {
-      throw new Error("Target project is not inside a git work tree");
-    }
-  }
-
+  /** Runs a git command synchronously and throws a detailed error on failure. */
   private runGit(projectPath: string, gitArgs: string[]): string {
     const result = this.runCommand("git", gitArgs, projectPath, undefined, 30000);
     if (result.error && result.error.code === "EPERM") {
@@ -1118,6 +599,7 @@ Return JSON only with:
     return result.stdout.trim();
   }
 
+  /** Runs a git command asynchronously and throws a detailed error on failure. */
   private async runGitAsync(projectPath: string, gitArgs: string[]): Promise<string> {
     const result = await this.runCommandAsync("git", gitArgs, projectPath, undefined, 30000);
     if (result.error && result.error.code === "EPERM") {
@@ -1136,111 +618,46 @@ Return JSON only with:
     return result.stdout.trim();
   }
 
+  /** Executes a synchronous child process with normalized environment handling. */
   private runCommand(
     command: string,
     args: string[],
     cwd?: string,
     input?: string,
     timeout?: number,
+    envOverrides?: NodeJS.ProcessEnv,
   ): CommandResult {
-    const result = spawnSync(command, args, {
+    return runCommandSync(command, args, {
       cwd,
       input,
-      encoding: "utf8",
-      env: process.env,
-      timeout,
-      maxBuffer: 16 * 1024 * 1024,
+      env: withEnv(envOverrides),
+      timeoutMs: timeout,
     });
-
-    return {
-      status: result.status,
-      signal: result.signal,
-      stdout: result.stdout || "",
-      stderr: result.stderr || "",
-      error: (result.error as NodeJS.ErrnoException | undefined) || null,
-    };
   }
 
+  /** Executes an asynchronous child process with normalized environment handling. */
   private runCommandAsync(
     command: string,
     args: string[],
     cwd?: string,
     input?: string,
     timeout?: number,
+    envOverrides?: NodeJS.ProcessEnv,
   ): Promise<CommandResult> {
-    return new Promise((resolve) => {
-      let stdout = "";
-      let stderr = "";
-      let settled = false;
-      let timeoutHandle: NodeJS.Timeout | null = null;
-      let timeoutError: NodeJS.ErrnoException | null = null;
-
-      const finish = (result: CommandResult) => {
-        if (settled) return;
-        settled = true;
-        if (timeoutHandle) {
-          clearTimeout(timeoutHandle);
-        }
-        resolve(result);
-      };
-
-      try {
-        const child = spawn(command, args, {
-          cwd,
-          env: process.env,
-          stdio: "pipe",
-        });
-
-        child.stdout.on("data", (chunk) => {
-          stdout += chunk.toString();
-        });
-
-        child.stderr.on("data", (chunk) => {
-          stderr += chunk.toString();
-        });
-
-        child.on("error", (error) => {
-          finish({
-            status: null,
-            signal: null,
-            stdout,
-            stderr,
-            error: error as NodeJS.ErrnoException,
-          });
-        });
-
-        child.on("close", (status, signal) => {
-          finish({
-            status,
-            signal,
-            stdout,
-            stderr,
-            error: timeoutError,
-          });
-        });
-
-        if (typeof input === "string" && input.length > 0) {
-          child.stdin.write(input);
-        }
-        child.stdin.end();
-
-        if (timeout && timeout > 0) {
-          timeoutHandle = setTimeout(() => {
-            const error = new Error(`Command timed out after ${timeout}ms`) as NodeJS.ErrnoException;
-            error.code = "ETIMEDOUT";
-            timeoutError = error;
-            child.kill("SIGTERM");
-          }, timeout);
-        }
-      } catch (error) {
-        finish({
-          status: null,
-          signal: null,
-          stdout,
-          stderr,
-          error: error as NodeJS.ErrnoException,
-        });
-      }
+    return runCommandAsync(command, args, {
+      cwd,
+      input,
+      env: withEnv(envOverrides),
+      timeoutMs: timeout,
     });
+  }
+
+  /** Returns the environment override that points Codex at DevGuard-managed auth. */
+  private getCodexEnv(): NodeJS.ProcessEnv | undefined {
+    if (!this.options.codexHome) {
+      return undefined;
+    }
+
+    return { CODEX_HOME: this.options.codexHome };
   }
 }
